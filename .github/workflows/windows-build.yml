@@ -1,4 +1,4 @@
-name: Windows Double & Single Precision Builds
+name: Windows Double & Single Precision Builds Oct2026
 
 on:
   push:
@@ -9,6 +9,9 @@ on:
 
 env:
   GIT_LFS_SKIP_SMUDGE: "1"
+  VCPKG_DEFAULT_TRIPLET: x64-windows-static
+  VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+  VCPKG_FORCE_SYSTEM_BINARIES: "1"
 
 jobs:
   double:
@@ -16,34 +19,71 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.8'
+      - name: Refresh vcpkg / submodules
+        shell: pwsh
+        run: |
+          git submodule update --init --recursive
+          if (Test-Path "vcpkg") {
+            git -C vcpkg fetch --all --tags
+            git -C vcpkg pull --ff-only
+          }
+      - &pin_cesium_native_vcpkg_step
+        name: Pin cesium-native vcpkg baseline
+        shell: pwsh
+        run: |
+          $nativeDir = Join-Path $PWD "cesium_godot/native"
+          $nativeRepo = "https://github.com/CesiumGS/cesium-native.git"
+          $nativeCommit = "9f6ae299e2709f866db52c4be29b6c31e10718c8"
+          if (-not (Test-Path $nativeDir)) {
+            git clone $nativeRepo $nativeDir
+          }
+          git -C $nativeDir reset --hard
+          git -C $nativeDir clean -fdx
+          git -C $nativeDir fetch origin $nativeCommit
+          git -C $nativeDir -c advice.detachedHead=false checkout $nativeCommit
+          git -C $nativeDir submodule sync --recursive
+          git -C $nativeDir submodule update --init --recursive --force
+          $cmakeFile = Join-Path $nativeDir "CMakeLists.txt"
+          $oldPin = "COMMIT dbe35ceb30c688bf72e952ab23778e009a578f18"
+          $newPin = "COMMIT 2025.09.17"
+          $content = Get-Content -Path $cmakeFile -Raw
+          if ($content.Contains($oldPin)) {
+            $content = $content.Replace($oldPin, $newPin)
+            Set-Content -Path $cmakeFile -Value $content -NoNewline -Encoding utf8NoBOM
+          } elseif (-not $content.Contains($newPin)) {
+            throw "Expected ezvcpkg commit pin not found in $cmakeFile"
+          }
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
 
-    - name: Install SCons
-      run: pip install scons
+      - name: Install SCons
+        run: pip install scons
 
-    - name: Setup MSVC 2022
-      uses: microsoft/setup-msbuild@v1.3
-      with:
-        vs-version: '17.7'
-        include-optional: true
+      - name: Setup MSVC 2022
+        uses: microsoft/setup-msbuild@v1.3
+        with:
+          vs-version: '17.7'
+          include-optional: true
 
-    - name: Build Extension (Double Precision Debug)
-      run: scons platform=windows arch=x64 compileTarget=extension target=template_release buildCesium=true precision=double
+      - name: Build Extension (Double Precision Debug)
+        run: scons platform=windows arch=x64 compileTarget=extension target=template_release buildCesium=true precision=double
 
-    - name: Verify Build Output
-      run: if ((gci godot3dtiles/addons/cesium_godot/lib -Filter "*.dll").Count -lt 1) { exit 1 }
+      - name: Verify Build Output
+        run: if ((gci godot3dtiles/addons/cesium_godot/lib -Filter "*.dll").Count -lt 1) { exit 1 }
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: godot3dtiles-double-precision-dev
-        path: godot3dtiles/
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot3dtiles-double-precision-dev
+          path: godot3dtiles/
 
   single:
     name: Build Godot3DTiles Extension (Single Precision)
@@ -51,31 +91,44 @@ jobs:
     needs: double
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.8'
+      - name: Refresh vcpkg / submodules
+        shell: pwsh
+        run: |
+          git submodule update --init --recursive
+          if (Test-Path "vcpkg") {
+            git -C vcpkg fetch --all --tags
+            git -C vcpkg pull --ff-only
+          }
+      - *pin_cesium_native_vcpkg_step
 
-    - name: Install SCons
-      run: pip install scons
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
 
-    - name: Setup MSVC 2022
-      uses: microsoft/setup-msbuild@v1.3
-      with:
-        vs-version: '17.7'
-        include-optional: true
+      - name: Install SCons
+        run: pip install scons
 
-    - name: Build Extension (Single Precision Debug)
-      run: scons platform=windows arch=x64 compileTarget=extension target=template_release buildCesium=true
+      - name: Setup MSVC 2022
+        uses: microsoft/setup-msbuild@v1.3
+        with:
+          vs-version: '17.7'
+          include-optional: true
 
-    - name: Verify Build Output
-      run: if ((gci godot3dtiles/addons/cesium_godot/lib -Filter "*.dll").Count -lt 1) { exit 1 }
+      - name: Build Extension (Single Precision Debug)
+        run: scons platform=windows arch=x64 compileTarget=extension target=template_release buildCesium=true
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: godot3dtiles-single-precision-dev
-        path: godot3dtiles/
+      - name: Verify Build Output
+        run: if ((gci godot3dtiles/addons/cesium_godot/lib -Filter "*.dll").Count -lt 1) { exit 1 }
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot3dtiles-single-precision-dev
+          path: godot3dtiles/
