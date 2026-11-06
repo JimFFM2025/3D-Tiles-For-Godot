@@ -10,6 +10,9 @@ using namespace godot;
 #endif
 
 #include <CesiumAsync/IAssetAccessor.h>
+#include <cstddef>
+#include <string>
+#include <vector>
 
 // Use Godot's native HTTPClient on macOS for better compatibility
 // (curl has DNS/SSL issues with macOS's network stack)
@@ -42,7 +45,7 @@ public:
 	void tick() noexcept override;
 
 private:
-	CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>> process_request(HTTPClient::Method method, const CesiumAsync::AsyncSystem &asyncSystem, const std::string &url, const std::vector<THeader> &headers = {});
+	CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>> process_request(HTTPClient::Method method, const std::string &verb, const CesiumAsync::AsyncSystem &asyncSystem, const std::string &url, const std::vector<THeader> &headers = {}, const std::vector<std::byte> &payload = {});
 
 #ifdef __APPLE__
 	GodotHttpClient<100> m_httpClient{};

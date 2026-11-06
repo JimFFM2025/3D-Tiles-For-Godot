@@ -23,7 +23,7 @@ void TokenTroubleshooting::is_valid_token(const String& token) {
   request.append(token.utf8().get_data());
   m_httpClient.send_get(
       request.c_str(),
-      [this, token](int32_t status, const PackedByteArray &body) { 
+      [this, token](int32_t status, const PackedByteArray &body, const std::vector<std::pair<std::string, std::string>> &) {
         // Get either a list of the available assets, or the error message
         Ref<JSON> jsonObj = memnew(JSON);
         std::string tmpStr(reinterpret_cast<const char*>(body.ptr()), body.size());

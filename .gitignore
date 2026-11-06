@@ -44,3 +44,7 @@ godot3dtiles/addons/cesium_godot/lib/*
 *.vcxproj
 *.vcxproj.filters
 *.dblite
+
+# Linux builds litehtml from source (CesiumBuildUtils.build_litehtml_linux)
+cesium_godot/third_party/litehtml-src/
+cesium_godot/third_party/litehtml/linux/

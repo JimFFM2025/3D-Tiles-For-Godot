@@ -148,10 +148,72 @@ def clone_bindings_repo_if_needed():
     )
 
 
+# The commit the headers in cesium_godot/third_party/litehtml/include come from.
+LITEHTML_COMMIT = "35ecd69d05e72b0148204a576db62c2148084193"
+
+LITEHTML_SOURCE_DIR = ROOT_DIR_EXT + "/third_party/litehtml-src"
+
+LITEHTML_LINUX_LIB_DIR = ROOT_DIR_EXT + "/third_party/litehtml/linux"
+
+
 def clone_lite_html_if_needed():
-    # clone_repo_if_needed(ROOT_DIR_EXT + "/third_party/lite-html", "Lite HTML",
-    #                      "https://github.com/litehtml/litehtml.git", "v0.9", "6ca1ab0419e770e6d35a1ef690238773a1dafcee")
-    pass
+    # Windows links the prebuilt .lib files and macOS the prebuilt archives in
+    # third_party/litehtml/macos. Linux builds litehtml from source: an archive
+    # built on a newer distro references glibc symbols (such as the C23
+    # __isoc23_strtol) that older systems lack, and the extension then fails
+    # to load there.
+    if os.name != OS_LINUX or sys.platform == PLATFORM_MACOS:
+        return
+    sourceDir = scons_to_abs_path(LITEHTML_SOURCE_DIR)
+    if os.path.exists(sourceDir):
+        return
+    print("Cloning litehtml repo")
+    # A commit, not a tag, so fetch it directly rather than with clone -b.
+    for command in (
+        ["git", "init", "-q", sourceDir],
+        ["git", "-C", sourceDir, "fetch", "-q", "--depth=1",
+         "https://github.com/litehtml/litehtml.git", LITEHTML_COMMIT],
+        ["git", "-C", sourceDir, "checkout", "-q", "FETCH_HEAD"],
+    ):
+        if subprocess.run(command).returncode != 0:
+            print("Error cloning litehtml", file=sys.stderr)
+            shutil.rmtree(sourceDir, ignore_errors=True)
+            exit(1)
+
+
+def build_litehtml_linux():
+    """Build litehtml and its bundled gumbo as static, position-independent
+    archives in third_party/litehtml/linux."""
+    source_dir = scons_to_abs_path(LITEHTML_SOURCE_DIR)
+    output_dir = scons_to_abs_path(LITEHTML_LINUX_LIB_DIR)
+    libs = ["liblitehtml.a", "libgumbo.a"]
+    if all(os.path.exists(os.path.join(output_dir, lib)) for lib in libs):
+        print("litehtml already built for Linux, skipping...")
+        return
+
+    print("Building litehtml from source for Linux...")
+    build_dir = os.path.join(source_dir, "build-linux")
+    configure = [
+        "cmake", "-S", source_dir, "-B", build_dir,
+        "-DCMAKE_BUILD_TYPE=Release",
+        # Linked into the extension's shared library.
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DLITEHTML_BUILD_TESTING=OFF",
+    ]
+    build = ["cmake", "--build", build_dir, "--parallel", get_build_parallel_level()]
+    for command in (configure, build):
+        if subprocess.run(command).returncode != 0:
+            print("Error building litehtml, see the output above", file=sys.stderr)
+            exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+    for lib in libs:
+        found = [os.path.join(root, lib) for root, _, files in os.walk(build_dir) if lib in files]
+        if not found:
+            print(f"Error: the litehtml build produced no {lib}", file=sys.stderr)
+            exit(1)
+        shutil.copy2(found[0], output_dir)
+    print("litehtml build complete!")
 
 
 def build_litehtml(arch="arm64"):
@@ -223,16 +285,46 @@ def clone_repo_if_needed(
     print(f"Cloning {name} repo")
     repoDirectory = scons_to_abs_path(targetDir)
     if os.path.exists(repoDirectory):
+        head = _git_head(repoDirectory)
+        if head != acceptedCommitSHA:
+            print(
+                f"[CESIUM] - Warning: {name} at {repoDirectory} is at {head}, "
+                f"expected {acceptedCommitSHA} ({branch})",
+                file=sys.stderr,
+            )
         return
-    subprocess.run(
+    result = subprocess.run(
         ["git", "clone", "--depth=1", "-b", branch, repoUrl, "--recursive", repoDirectory]
     )
+    if result.returncode != 0:
+        print(f"Error cloning {name} from {repoUrl}", file=sys.stderr)
+        exit(1)
 
-    # Shouldn't we just rely on the repo tags?
-    # prevDir: str = os.getcwd()
-    # os.chdir(repoDirectory)
-    # subprocess.run(["git", "reset", "--hard", acceptedCommitSHA])
-    # os.chdir(prevDir)
+    # Tags can be moved, so check the clone against the accepted commit.
+    head = _git_head(repoDirectory)
+    if head != acceptedCommitSHA:
+        print(
+            f"Error: {name} tag {branch} is at {head}, expected {acceptedCommitSHA}",
+            file=sys.stderr,
+        )
+        exit(1)
+
+
+def _git_head(repoDirectory: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", repoDirectory, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def is_deps_only(argsDict) -> bool:
+    return argsDict.get("deps_only", "no").upper() in ("YES", "TRUE", "1")
+
+
+def get_build_parallel_level() -> str:
+    return os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or str(os.cpu_count() or 1)
 
 
 # Configure with CMake
@@ -253,6 +345,9 @@ def configure_native(argumentsDict):
             "-DCESIUM_MSVC_STATIC_RUNTIME_ENABLED=ON",
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
             "-DGIT_LFS_SKIP_SMUDGE=1",
+            # The extension links none of cesium-native's tests; skipping them
+            # saves the Catch2 port and the test sources from the build.
+            "-DCESIUM_TESTS_ENABLED=OFF",
             "-DVCPKG_TRIPLET=%s" % triplet,
             ".",
         ]
@@ -319,11 +414,11 @@ def compile_native(argumentsDict):
 
 
 def build_native_linux():
-    return subprocess.run(["cmake", "--build", "."])
+    return subprocess.run(["cmake", "--build", ".", "--parallel", get_build_parallel_level()])
 
 
 def build_native_macos():
-    return subprocess.run(["cmake", "--build", "."])
+    return subprocess.run(["cmake", "--build", ".", "--parallel", get_build_parallel_level()])
 
 
 def build_native_win(buildDirectory: str):

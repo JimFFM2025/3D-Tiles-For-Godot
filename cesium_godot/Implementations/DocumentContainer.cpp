@@ -147,8 +147,9 @@ void DocumentContainer::load_image(const char* src, const char* baseurl, bool re
 	if (this->m_imageCache.find(HashFnv1a(fetchUrl)) != this->m_imageCache.end()) {
 		return;
 	}
-	this->m_httpClient.send_get_same_thread(src, [fetchUrl, this](int32_t status, const PackedByteArray& body) {
-        if (status >= HTTPClient::ResponseCode::RESPONSE_BAD_REQUEST) {
+	this->m_httpClient.send_get_same_thread(src, [fetchUrl, this](int32_t status, const PackedByteArray& body, const std::vector<std::pair<std::string, std::string>>&) {
+        // A request that failed outright has status 0 and no body.
+        if (status >= HTTPClient::ResponseCode::RESPONSE_BAD_REQUEST || body.is_empty()) {
 			std::string tmpStr(reinterpret_cast<const char*>(body.ptr()), body.size());
 	        String bodyStr = tmpStr.c_str();
         	// ERR_PRINT(String("Not able to load image from ") + String(fetchUrl.c_str()) + String(", response: ") + bodyStr);

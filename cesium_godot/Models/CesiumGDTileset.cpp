@@ -19,7 +19,6 @@
 #include "godot_cpp/variant/transform3d.hpp"
 #include <cstdint>
 #include <type_traits>
-#define SPDLOG_COMPILED_LIB
 #include "Models/CesiumGlobe.h"
 #define SPDLOG_FMT_EXTERNAL
 
@@ -72,6 +71,9 @@ using namespace godot;
 #include "CesiumAsync/GunzipAssetAccessor.h"
 #include <CesiumAsync/CachingAssetAccessor.h>
 #include "CesiumAsync/SqliteCache.h"
+#include "../Utils/RedactCredentials.h"
+#include <memory>
+#include <mutex>
 
 
 static int32_t tileCount = 0;
@@ -222,7 +224,7 @@ Cesium3DTileset::Cesium3DTileset()
 	this->m_tilesetConfig->contentOptions.ktx2TranscodeTargets = { supportedFormats, true };
 
 	this->m_tilesetConfig->options.loadErrorCallback = [=](const Cesium3DTilesSelection::TilesetLoadFailureDetails& failData) {
-		ERR_PRINT(String("Failed to load a given tileset, error: ") + failData.message.c_str());
+		ERR_PRINT(String("Failed to load a given tileset, error: ") + String::utf8(redact_credentials(failData.message).c_str()));
 	};
 
 	this->m_signalingThreadPool.init(5);
@@ -616,8 +618,18 @@ void Cesium3DTileset::load_tileset()
 
 }
 
-Cesium3DTilesSelection::TilesetExternals Cesium3DTileset::create_tileset_externals()
+/// The request cache every tileset shares, as long as any tileset uses it. Each SqliteCache is its
+/// own connection to the database file and sets no busy timeout, so with one per tileset a write
+/// fails whenever another tileset is writing; one instance serializes them.
+static std::shared_ptr<CesiumAsync::SqliteCache> get_request_cache()
 {
+	static std::mutex s_mutex;
+	static std::weak_ptr<CesiumAsync::SqliteCache> s_cache;
+	std::lock_guard<std::mutex> lock(s_mutex);
+	std::shared_ptr<CesiumAsync::SqliteCache> cache = s_cache.lock();
+	if (cache != nullptr) {
+		return cache;
+	}
 	const String cachePath = "user://cache";
 	Ref<DirAccess> userAccess = DirAccess::open("user://");
 	Error err = userAccess->make_dir_recursive(cachePath);
@@ -625,10 +637,16 @@ Cesium3DTilesSelection::TilesetExternals Cesium3DTileset::create_tileset_externa
 		ERR_PRINT("Could not create / use temporary cache path!");
 	}
 	String globalCachePath = ProjectSettings::get_singleton()->globalize_path(cachePath) + "/cesium-request-cache.sqlite";
-	constexpr int32_t requestsPerCachePrune = 10000;
 	constexpr uint64_t maxItems = 4096 * 5;
+	cache = std::make_shared<CesiumAsync::SqliteCache>(spdlog::default_logger(), globalCachePath.utf8().get_data(), maxItems);
+	s_cache = cache;
+	return cache;
+}
 
-	auto cache = std::make_shared<CesiumAsync::SqliteCache>(spdlog::default_logger(), globalCachePath.utf8().get_data(), maxItems);
+Cesium3DTilesSelection::TilesetExternals Cesium3DTileset::create_tileset_externals()
+{
+	constexpr int32_t requestsPerCachePrune = 10000;
+	auto cache = get_request_cache();
 	auto simpleAccessor = std::make_shared<NetworkAssetAccessor>();
 	auto cachedAccessor = std::make_shared<CesiumAsync::CachingAssetAccessor>(spdlog::default_logger(), simpleAccessor, cache, requestsPerCachePrune);
 	auto gunzipAccessor = std::make_shared<CesiumAsync::GunzipAssetAccessor>(

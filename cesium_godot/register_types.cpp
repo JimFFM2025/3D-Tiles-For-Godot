@@ -15,6 +15,7 @@
 #include "Models/CesiumPropertyInfo.h"
 #include "Utils/CesiumGDAssetBuilder.h"
 #include "Utils/TokenTroubleShooting.h"		
+#include "Utils/RedactingLogSink.h"
 #include "godot_cpp/classes/engine.hpp"
 #include <cstdio>
 
@@ -33,6 +34,8 @@ void initialize_cesium_godot_module(ModuleInitializationLevel p_level) {
 	//But we will keep it to the Scene for some testing that the library has been properly linked
 	if (p_level != ModuleInitializationLevel::MODULE_INITIALIZATION_LEVEL_SCENE)
 		return;
+	// Cesium Native logs request URLs, with Cesium ion's access token in them.
+	RedactingLogSink::install();
 	//We will have to register all external classes to the class DB (we probably don't want this for common DataStructures, but rather Nodes)
 	ClassDB::register_class<CesiumGeoreference>();
 	ClassDB::register_class<Cesium3DTileset>();

@@ -22,14 +22,19 @@ using namespace godot;
 #endif
 
 #include "BRThreadPool.h"
+#include "DataUri.h"
+#include "RedactCredentials.h"
 #include <curl/curl.h>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <vector>
 #include <string>
+#include <string_view>
 
-using HighLevelResponseCallback_t = std::function<void(int32_t, const PackedByteArray&)>;
 using CesiumHeader_t = std::pair<std::string, std::string>;
+/// Called with the status code, the body and the response's headers, in the order received.
+using HighLevelResponseCallback_t = std::function<void(int32_t, const PackedByteArray&, const std::vector<CesiumHeader_t>&)>;
 
 /// @brief One reusable curl easy handle per thread. A handle is never shared between threads, and
 /// it is reset before each request so options from an earlier request (method, headers, ...) never
@@ -89,19 +94,22 @@ public:
 		this->send_request_same_thread(url, HTTPClient::METHOD_GET, callback, headers);
 	}
 
-	void send_request(const char* url, HTTPClient::Method method, const HighLevelResponseCallback_t& callback, const std::vector<CesiumHeader_t>& headers) {
+	/// Sends body too, with any method but GET and HEAD.
+	void send_request(const char* url, HTTPClient::Method method, const HighLevelResponseCallback_t& callback, const std::vector<CesiumHeader_t>& headers, const std::vector<std::byte>& body = {}) {
 		// Everything the request needs is captured by value: this returns before the request runs.
-		this->m_threadPool.enqueue([this, urlCopy = std::string(url), method, headers, callback] {
+		this->m_threadPool.enqueue([this, urlCopy = std::string(url), method, headers, body, callback] {
 			long responseCode = 0;
-			PackedByteArray packedData = this->pull_url(urlCopy.c_str(), method, &responseCode, headers);
-			callback(responseCode, packedData);
+			std::vector<CesiumHeader_t> responseHeaders;
+			PackedByteArray packedData = this->pull_url(urlCopy.c_str(), method, &responseCode, headers, &responseHeaders, body);
+			callback(responseCode, packedData, responseHeaders);
 		});
 	}
 
 	void send_request_same_thread(const char *url, HTTPClient::Method method, const HighLevelResponseCallback_t &callback, const std::vector<CesiumHeader_t> &headers) {
 		long responseCode = 0;
-		PackedByteArray packedData = this->pull_url(url, method, &responseCode, headers);
-		callback(responseCode, packedData);
+		std::vector<CesiumHeader_t> responseHeaders;
+		PackedByteArray packedData = this->pull_url(url, method, &responseCode, headers, &responseHeaders);
+		callback(responseCode, packedData, responseHeaders);
 	}
 
 	void add_default_header(const CesiumHeader_t& header) {
@@ -111,7 +119,8 @@ public:
 
 private:
 	static void configure_http_method(CURL* handle, HTTPClient::Method method) {
-		// Requests never carry a body here, so make sure curl does not try to read one (from stdin).
+		// pull_url sets any body afterwards; without one, make sure curl does not try to read one
+		// (from stdin).
 		switch (method) {
 			case HTTPClient::METHOD_GET:
 				break;
@@ -146,12 +155,23 @@ private:
 		}
 	}
 
-	PackedByteArray pull_url(const char *url, HTTPClient::Method method, long *outStatus, const std::vector<CesiumHeader_t> &headers) {
+	PackedByteArray pull_url(const char *url, HTTPClient::Method method, long *outStatus, const std::vector<CesiumHeader_t> &headers, std::vector<CesiumHeader_t> *outHeaders, const std::vector<std::byte> &body = {}) {
 		*outStatus = 0;
+		outHeaders->clear();
 		PackedByteArray buffer;
+		if (is_data_uri(url)) {
+			// curl has no data: scheme, so decode the content here.
+			if (decode_data_uri(url, buffer)) {
+				*outStatus = HTTPClient::RESPONSE_OK;
+			} else {
+				ERR_PRINT("Unsupported data: URI; only base64 content is supported");
+				*outStatus = HTTPClient::RESPONSE_BAD_REQUEST;
+			}
+			return buffer;
+		}
 		CURL* handle = ThreadCurlHandle::acquire();
 		if (handle == nullptr) {
-			ERR_PRINT(String("Could not create a curl handle for: ") + String::utf8(url));
+			ERR_PRINT(String("Could not create a curl handle for: ") + String::utf8(redact_credentials(url).c_str()));
 			return buffer;
 		}
 
@@ -161,8 +181,15 @@ private:
 		curl_easy_setopt(handle, CURLOPT_URL, url);
 		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &CurlHttpClient::write_callback);
 		curl_easy_setopt(handle, CURLOPT_WRITEDATA, &buffer);
+		curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &CurlHttpClient::header_callback);
+		curl_easy_setopt(handle, CURLOPT_HEADERDATA, outHeaders);
 		curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "");
 		configure_http_method(handle, method);
+		if (!body.empty() && method != HTTPClient::METHOD_GET && method != HTTPClient::METHOD_HEAD) {
+			// With CURLOPT_CUSTOMREQUEST (PUT, PATCH, ...) curl sends this body with that method.
+			curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+			curl_easy_setopt(handle, CURLOPT_COPYPOSTFIELDS, reinterpret_cast<const char*>(body.data()));
+		}
 
 		curl_slist* curlHeaders = nullptr;
 		{
@@ -180,13 +207,41 @@ private:
 		if (code == CURLE_OK) {
 			curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, outStatus);
 		} else {
-			ERR_PRINT(String("Could not make request to: ") + String::utf8(url) + String(" error: ") + itos(code) + " (" + curl_easy_strerror(code) + ")");
+			ERR_PRINT(String("Could not make request to: ") + String::utf8(redact_credentials(url).c_str()) + String(" error: ") + itos(code) + " (" + curl_easy_strerror(code) + ")");
 			buffer = PackedByteArray();
+			outHeaders->clear();
 		}
 		// The handle keeps a pointer to the header list until its next reset, so clear it first.
 		curl_easy_setopt(handle, CURLOPT_HTTPHEADER, nullptr);
 		curl_slist_free_all(curlHeaders);
 		return buffer;
+	}
+
+	/// Collects the response's headers. After a redirect curl reports each response's headers in
+	/// turn, every set starting with its status line, so a status line starts the list over and only
+	/// the final response's headers remain.
+	static size_t header_callback(char *line, size_t size, size_t nitems, void *userp) {
+		auto *headers = reinterpret_cast<std::vector<CesiumHeader_t>*>(userp);
+		const size_t length = size * nitems;
+		const std::string_view text(line, length);
+		if (text.rfind("HTTP/", 0) == 0) {
+			headers->clear();
+			return length;
+		}
+		const size_t colon = text.find(':');
+		if (colon != std::string_view::npos) { // Not the blank line that ends the headers.
+			headers->emplace_back(trim(text.substr(0, colon)), trim(text.substr(colon + 1)));
+		}
+		return length;
+	}
+
+	static std::string trim(std::string_view text) {
+		constexpr std::string_view SPACE = " \t\r\n";
+		const size_t first = text.find_first_not_of(SPACE);
+		if (first == std::string_view::npos) {
+			return std::string();
+		}
+		return std::string(text.substr(first, text.find_last_not_of(SPACE) - first + 1));
 	}
 
 	static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {

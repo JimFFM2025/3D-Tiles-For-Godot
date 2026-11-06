@@ -17,6 +17,10 @@ using namespace godot;
 #endif
 
 #include "BRThreadPool.h"
+#include "DataUri.h"
+#include "RedactCredentials.h"
+#include <cstddef>
+#include <cstring>
 #include <functional>
 #include <vector>
 #include <string>
@@ -25,8 +29,9 @@ using namespace godot;
 #include <thread>
 #include <chrono>
 
-using GodotResponseCallback_t = std::function<void(int32_t, const PackedByteArray&)>;
 using GodotHeader_t = std::pair<std::string, std::string>;
+/// Called with the status code, the body and the response's headers, in the order received.
+using GodotResponseCallback_t = std::function<void(int32_t, const PackedByteArray&, const std::vector<GodotHeader_t>&)>;
 
 /// @brief HTTP client using Godot's native HTTPClient instead of libcurl.
 /// This provides better cross-platform compatibility, especially on macOS
@@ -56,15 +61,17 @@ public:
 		send_request_same_thread(url, HTTPClient::METHOD_GET, callback, headers);
 	}
 
-	void send_request(const char* url, HTTPClient::Method method, const GodotResponseCallback_t& callback, const std::vector<GodotHeader_t>& headers) {
+	/// Sends requestBody too, with any method but GET and HEAD.
+	void send_request(const char* url, HTTPClient::Method method, const GodotResponseCallback_t& callback, const std::vector<GodotHeader_t>& headers, const std::vector<std::byte>& requestBody = {}) {
 		std::string urlCopy = url;
 		std::vector<GodotHeader_t> allHeaders = m_defaultHeaders;
 		allHeaders.insert(allHeaders.end(), headers.begin(), headers.end());
 
-		m_threadPool.enqueue([this, urlCopy, method, callback, allHeaders] {
+		m_threadPool.enqueue([this, urlCopy, method, callback, allHeaders, requestBody] {
 			int32_t responseCode = 0;
-			PackedByteArray body = perform_request(urlCopy.c_str(), method, &responseCode, allHeaders);
-			callback(responseCode, body);
+			std::vector<GodotHeader_t> responseHeaders;
+			PackedByteArray body = perform_request(urlCopy.c_str(), method, &responseCode, allHeaders, &responseHeaders, requestBody);
+			callback(responseCode, body, responseHeaders);
 		});
 	}
 
@@ -73,8 +80,9 @@ public:
 		allHeaders.insert(allHeaders.end(), headers.begin(), headers.end());
 
 		int32_t responseCode = 0;
-		PackedByteArray body = perform_request(url, method, &responseCode, allHeaders);
-		callback(responseCode, body);
+		std::vector<GodotHeader_t> responseHeaders;
+		PackedByteArray body = perform_request(url, method, &responseCode, allHeaders, &responseHeaders);
+		callback(responseCode, body, responseHeaders);
 	}
 
 	void add_default_header(const GodotHeader_t& header) {
@@ -137,23 +145,21 @@ private:
 		return parts;
 	}
 
-	PackedByteArray perform_request(const char* url, HTTPClient::Method method, int32_t* outStatus, const std::vector<GodotHeader_t>& headers) {
+	PackedByteArray perform_request(const char* requestUrl, HTTPClient::Method method, int32_t* outStatus, const std::vector<GodotHeader_t>& headers, std::vector<GodotHeader_t>* outHeaders, const std::vector<std::byte>& requestBody = {}) {
 		PackedByteArray buffer;
 		*outStatus = 0;
 
-		std::string urlStr(url);
+		std::string urlStr(requestUrl);
+		// For messages: the URL without its credentials.
+		const String url = String::utf8(redact_credentials(urlStr).c_str());
 
 		// Handle data: URIs (base64-encoded inline data, used by Cesium credit logos)
-		if (urlStr.rfind("data:", 0) == 0) {
-			size_t base64Pos = urlStr.find(";base64,");
-			if (base64Pos != std::string::npos) {
-				std::string base64Data = urlStr.substr(base64Pos + 8);
-				String godotBase64 = String(base64Data.c_str());
-				buffer = Marshalls::get_singleton()->base64_to_raw(godotBase64);
+		if (is_data_uri(urlStr)) {
+			if (decode_data_uri(urlStr, buffer)) {
 				*outStatus = HTTPClient::RESPONSE_OK;
 				return buffer;
 			}
-			ERR_PRINT(String("Invalid data URI format: ") + url);
+			ERR_PRINT("Unsupported data: URI; only base64 content is supported");
 			*outStatus = HTTPClient::RESPONSE_BAD_REQUEST;
 			return PackedByteArray();
 		}
@@ -214,7 +220,15 @@ private:
 		}
 
 		// Send request
-		Error requestErr = http->request(method, String(parts.path.c_str()), godotHeaders);
+		Error requestErr = Error::OK;
+		if (!requestBody.empty() && method != HTTPClient::METHOD_GET && method != HTTPClient::METHOD_HEAD) {
+			PackedByteArray bodyBytes;
+			bodyBytes.resize(static_cast<int64_t>(requestBody.size()));
+			memcpy(bodyBytes.ptrw(), requestBody.data(), requestBody.size());
+			requestErr = http->request_raw(method, String(parts.path.c_str()), godotHeaders, bodyBytes);
+		} else {
+			requestErr = http->request(method, String(parts.path.c_str()), godotHeaders);
+		}
 		if (requestErr != Error::OK) {
 			ERR_PRINT(String("Failed to send request to: ") + url + " error: " + itos(static_cast<int>(requestErr)));
 			*outStatus = 0;
@@ -243,6 +257,16 @@ private:
 		}
 
 		*outStatus = http->get_response_code();
+		const PackedStringArray responseHeaders = http->get_response_headers();
+		for (int64_t i = 0; i < responseHeaders.size(); i++) {
+			const String line = responseHeaders[i];
+			const int64_t colon = line.find(":");
+			if (colon > 0) {
+				outHeaders->emplace_back(
+					line.substr(0, colon).strip_edges().utf8().get_data(),
+					line.substr(colon + 1).strip_edges().utf8().get_data());
+			}
+		}
 
 		// Read response body
 		while (http->get_status() == HTTPClient::STATUS_BODY) {

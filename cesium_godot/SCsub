@@ -22,6 +22,10 @@ if os.name == cesium_build_utils.OS_WIN:
     env.Append(CXXFLAGS=["/EHsc"])
 env.Append(CPPDEFINES=["SPDLOG_NO_EXCEPTIONS",
                        "LIBASYNC_NO_EXCEPTIONS"])
+# spdlog is linked as vcpkg's compiled library, so use it as one (vcpkg's spdlog
+# target defines this for its users). Header-only spdlog here would give the plugin
+# its own registry and default logger, apart from the one Cesium Native logs to.
+env.Append(CPPDEFINES=["SPDLOG_COMPILED_LIB"])
 
 includePaths = []
 sources = [
@@ -392,8 +396,13 @@ common_libpaths = [
     ) + "/installed/%s/lib" % (cesium_build_utils.determine_triplet())
 ]
 
-# Add litehtml path (macOS uses its own path added earlier, others use base path)
-if sys.platform != cesium_build_utils.PLATFORM_MACOS:
+# Add litehtml path (macOS uses its own path added earlier, Linux the archives
+# built from source, Windows the prebuilt libraries in the base path)
+if sys.platform == cesium_build_utils.PLATFORM_MACOS:
+    pass
+elif os.name == cesium_build_utils.OS_LINUX:
+    common_libpaths.append(cesium_build_utils.LITEHTML_LINUX_LIB_DIR)
+else:
     common_libpaths.append(cesium_build_utils.get_root_dir() + "/third_party/litehtml")
 
 env.Append(
