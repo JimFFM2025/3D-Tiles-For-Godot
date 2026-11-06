@@ -1,0 +1,108 @@
+name: Windows Release (Double & Single Precision)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  GIT_LFS_SKIP_SMUDGE: "1"
+  VCPKG_DEFAULT_TRIPLET: x64-windows-static
+  VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+  VCPKG_FORCE_SYSTEM_BINARIES: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows Extension (${{ matrix.precision }})
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        precision: [single, double]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+
+      - name: Install SCons
+        run: pip install scons
+
+      - name: Setup MSVC 2022
+        uses: microsoft/setup-msbuild@v1.3
+        with:
+          vs-version: '17.7'
+          include-optional: true
+
+      - name: Restore vcpkg packages
+        id: vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ezvcpkg
+          key: ezvcpkg-windows-${{ hashFiles('CesiumBuildUtils.py') }}
+          restore-keys: ezvcpkg-windows-
+
+      - name: Build Extension (Single Precision)
+        if: matrix.precision == 'single'
+        run: scons platform=windows arch=x64 compileTarget=extension target=template_release buildCesium=true
+
+      - name: Build Extension (Double Precision)
+        if: matrix.precision == 'double'
+        run: scons platform=windows arch=x64 compileTarget=extension target=template_release buildCesium=true precision=double
+
+      - name: Verify Build Output
+        shell: pwsh
+        run: |
+          if ((Get-ChildItem godot3dtiles/addons/cesium_godot/lib -Filter "*.dll").Count -lt 1) { 
+            Write-Error "No DLL built!"
+            exit 1 
+          }
+
+      - name: Save vcpkg packages
+        if: always() && steps.vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ezvcpkg
+          key: ${{ steps.vcpkg.outputs.cache-primary-key }}
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czvf dist/cesium_godot-windows-${{ matrix.precision }}-x86_64.tar.gz -C godot3dtiles/addons/cesium_godot .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cesium_godot-windows-${{ matrix.precision }}-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/**/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "Windows x86_64 builds of $GITHUB_SHA (Single and Double precision)."
