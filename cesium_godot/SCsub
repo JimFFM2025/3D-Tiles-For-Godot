@@ -146,6 +146,10 @@ libraries = [
 
 if (os.name == cesium_build_utils.OS_WIN):
     libraries.extend([
+        # --- ADD THESE TWO LINES AT THE TOP OF THE WINDOWS LIBRARIES LIST ---
+        "iphlpapi",
+        "secur32",
+        # ------------------------------------------------------------------
         "absl_bad_any_cast_impl",
         "absl_bad_optional_access",
         "absl_bad_variant_access",
